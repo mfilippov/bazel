@@ -26,6 +26,7 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.NotDirectoryException;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
@@ -226,5 +227,140 @@ public class WindowsFileOperationsTest {
 
     assertThat(WindowsFileOperations.statIfSupported(path, /* followReparsePoints= */ true))
         .isNull();
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // readDirectory
+  //
+  // These cases test the enumeration itself: the names, the attribute bits, and the error map.
+  // WindowsFileSystemTest tests the readdir override above it, which turns those bits into a
+  // Dirent.Type. The two levels fail for different reasons, so they need separate tests.
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void testReadDirectoryReturnsNamesAndAttributes() throws Exception {
+    testUtil.scratchFile("dir/file.txt", "hello");
+    testUtil.scratchDir("dir/subdir");
+    testUtil.scratchDir("target");
+    testUtil.createJunctions(ImmutableMap.of("dir/junc", "target"));
+
+    WindowsFileOperations.Dirents entries =
+        WindowsFileOperations.readDirectory(new File(scratchRoot, "dir").toString());
+
+    assertThat(entries.names()).hasLength(3);
+    assertThat(entries.attributes()).hasLength(3);
+    // "." and ".." are not entries.
+    assertThat(Arrays.asList(entries.names())).containsExactly("file.txt", "subdir", "junc");
+
+    Map<String, Integer> byName = new HashMap<>();
+    for (int i = 0; i < entries.names().length; i++) {
+      byName.put(entries.names()[i], entries.attributes()[i]);
+    }
+
+    assertThat(byName.get("file.txt") & WindowsFileOperations.FILE_ATTRIBUTE_DIRECTORY)
+        .isEqualTo(0);
+    assertThat(byName.get("file.txt") & WindowsFileOperations.FILE_ATTRIBUTE_REPARSE_POINT)
+        .isEqualTo(0);
+
+    assertThat(byName.get("subdir") & WindowsFileOperations.FILE_ATTRIBUTE_DIRECTORY)
+        .isNotEqualTo(0);
+    assertThat(byName.get("subdir") & WindowsFileOperations.FILE_ATTRIBUTE_REPARSE_POINT)
+        .isEqualTo(0);
+
+    // A junction sets both bits. A caller that wants to tell a link from a directory must
+    // therefore test FILE_ATTRIBUTE_REPARSE_POINT first.
+    assertThat(byName.get("junc") & WindowsFileOperations.FILE_ATTRIBUTE_REPARSE_POINT)
+        .isNotEqualTo(0);
+    assertThat(byName.get("junc") & WindowsFileOperations.FILE_ATTRIBUTE_DIRECTORY).isNotEqualTo(0);
+  }
+
+  @Test
+  public void testReadDirectoryOnEmptyDirectory() throws Exception {
+    testUtil.scratchDir("empty");
+
+    WindowsFileOperations.Dirents entries =
+        WindowsFileOperations.readDirectory(new File(scratchRoot, "empty").toString());
+
+    assertThat(entries.names()).isEmpty();
+    assertThat(entries.attributes()).isEmpty();
+  }
+
+  @Test
+  public void testReadDirectoryThrowsFileNotFoundForMissingPath() {
+    assertThrows(
+        FileNotFoundException.class,
+        () -> WindowsFileOperations.readDirectory(new File(scratchRoot, "nope").toString()));
+  }
+
+  @Test
+  public void testReadDirectoryThrowsFileNotFoundForMissingParent() {
+    assertThrows(
+        FileNotFoundException.class,
+        () ->
+            WindowsFileOperations.readDirectory(
+                new File(scratchRoot, "nope/child").toString()));
+  }
+
+  @Test
+  public void testReadDirectoryThrowsNotDirectoryForRegularFile() throws Exception {
+    testUtil.scratchFile("file.txt", "hello");
+
+    // A separate exception from FileNotFoundException: the path exists, and it is not a directory.
+    // FileSystem#readdir maps the two to different errors, so the enumeration must separate them.
+    assertThrows(
+        NotDirectoryException.class,
+        () -> WindowsFileOperations.readDirectory(new File(scratchRoot, "file.txt").toString()));
+  }
+
+  @Test
+  public void testReadDirectoryRejectsPathThatIsNotNormalized() throws Exception {
+    testUtil.scratchFile("dir/file.txt", "hello");
+
+    // WindowsPathOperations#asLongPath adds the "\\?\" prefix, and Win32 passes an
+    // extended-length path through without a change. A path with "\.\" in it therefore reaches
+    // the filesystem as it is. readDirectory applies the same IsAbsoluteNormalizedWindowsPath test
+    // that each other native in this class applies, and fails with the path in the message.
+    //
+    // PathFragment normalizes on construction, so Bazel cannot produce such a path. This case
+    // holds the behaviour, and it is not a limit that a caller can reach.
+    IOException e =
+        assertThrows(
+            IOException.class,
+            () ->
+                WindowsFileOperations.readDirectory(
+                    new File(scratchRoot, ".\\dir").toString()));
+    assertThat(e).hasMessageThat().contains("dir");
+  }
+
+  @Test
+  public void testReadDirectoryWithPathLongerThanMaxPath() throws Exception {
+    // MAX_PATH is 260. Build a path past it from segments that are each ordinary.
+    StringBuilder relative = new StringBuilder("longpath");
+    for (int i = 0; i < 8; i++) {
+      relative.append("/0123456789abcdefghijklmnopqrstuvwxyz");
+    }
+    testUtil.scratchFile(relative + "/leaf.txt", "hello");
+    File dir = new File(scratchRoot, relative.toString().replace('/', '\\'));
+    assertThat(dir.toString().length()).isGreaterThan(260);
+
+    WindowsFileOperations.Dirents entries = WindowsFileOperations.readDirectory(dir.toString());
+
+    assertThat(Arrays.asList(entries.names())).containsExactly("leaf.txt");
+  }
+
+  @Test
+  public void testReadDirectoryWithManyEntries() throws Exception {
+    // Enough entries to need more than one FindNextFileW batch. A listing that stopped early
+    // would show up here, and nowhere else.
+    testUtil.scratchDir("many");
+    for (int i = 0; i < 2000; i++) {
+      testUtil.scratchFile("many/entry-" + i, "x");
+    }
+
+    WindowsFileOperations.Dirents entries =
+        WindowsFileOperations.readDirectory(new File(scratchRoot, "many").toString());
+
+    assertThat(entries.names()).hasLength(2000);
+    assertThat(entries.attributes()).hasLength(2000);
   }
 }

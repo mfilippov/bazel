@@ -14,11 +14,13 @@
 package com.google.devtools.build.lib.windows;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.ProfilerTask;
 import com.google.devtools.build.lib.util.StringEncoding;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
+import com.google.devtools.build.lib.vfs.Dirent;
 import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.JavaIoFileSystem;
 import com.google.devtools.build.lib.vfs.PathFragment;
@@ -28,8 +30,10 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NotDirectoryException;
 import java.nio.file.Path;
 import java.nio.file.attribute.DosFileAttributes;
+import java.util.Collection;
 
 /** File system implementation for Windows. */
 @ThreadSafe
@@ -107,6 +111,106 @@ public class WindowsFileSystem extends JavaIoFileSystem {
     return PathFragment.create(
         StringEncoding.platformToInternal(
             WindowsFileOperations.readSymlinkOrJunction(nioPath.toString())));
+  }
+
+  /**
+   * Lists a directory's entries, and the name of each one only.
+   *
+   * <p>Overridden so that this class answers both questions from the same enumeration. The
+   * inherited implementation calls {@code File#list}, which resolves the path a second time, and
+   * one file system that answers the same question two ways is one file system that can give two
+   * answers.
+   */
+  @Override
+  public Collection<String> getDirectoryEntries(PathFragment path) throws IOException {
+    // Straight from the enumeration, and not through readdir: the caller wants names, and
+    // classifying each entry to build a Dirent that is then thrown away is work nobody asked for.
+    // UnixFileSystem implements the two methods side by side for the same reason.
+    String[] names = enumerate(path).names();
+    ImmutableList.Builder<String> entries = ImmutableList.builderWithExpectedSize(names.length);
+    for (String name : names) {
+      entries.add(StringEncoding.platformToInternal(name));
+    }
+    return entries.build();
+  }
+
+  /**
+   * Lists a directory's entries along with their types.
+   *
+   * <p>The inherited implementation lists the directory and then stats every entry, which on
+   * Windows means resolving every child path through the filesystem driver stack a second time. A
+   * directory enumeration already reports each entry's attributes, so that second resolution asks
+   * for something the platform has already said.
+   *
+   * <p>This mirrors {@code UnixFileSystem#readdir}, which has always taken the type from {@code
+   * d_type} and only stats an entry when the type is unusable, or when a symlink has to be
+   * resolved because {@code followSymlinks} was requested.
+   */
+  @Override
+  public Collection<Dirent> readdir(PathFragment path, boolean followSymlinks) throws IOException {
+    WindowsFileOperations.Dirents entries = enumerate(path);
+    String[] names = entries.names();
+    int[] attributes = entries.attributes();
+    ImmutableList.Builder<Dirent> dirents = ImmutableList.builderWithExpectedSize(names.length);
+    for (int i = 0; i < names.length; i++) {
+      String entryName = StringEncoding.platformToInternal(names[i]);
+      Dirent.Type type;
+      if ((attributes[i] & WindowsFileOperations.FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        // Bazel treats a junction like a symlink, so every reparse point is a symlink here - the
+        // same single-bit test WindowsFileOperations#isSymlinkOrJunction performs, and the same
+        // rule stat() applies. Following one is the only case that still needs a syscall of its
+        // own, and reparse points are rare; the hot callers (SyscallCache#readdir, UnixGlob) pass
+        // followSymlinks=false and never reach it at all.
+        type =
+            followSymlinks
+                ? direntFromStat(statNullable(path.getChild(entryName), true))
+                : Dirent.Type.SYMLINK;
+      } else if ((attributes[i] & WindowsFileOperations.FILE_ATTRIBUTE_DEVICE) != 0) {
+        // Before the directory bit, because direntFromStat asks isSpecialFile before isDirectory
+        // and isSpecialFile is this bit. An enumeration is not documented to report it; the branch
+        // is here so that the two paths cannot disagree about an entry if one ever does.
+        type = Dirent.Type.UNKNOWN;
+      } else if ((attributes[i] & WindowsFileOperations.FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        // The directory bit is only trustworthy once the entry is known not to be a reparse point:
+        // it is set on junctions and directory symlinks too.
+        type = Dirent.Type.DIRECTORY;
+      } else {
+        type = Dirent.Type.FILE;
+      }
+      dirents.add(new Dirent(entryName, type));
+    }
+    return dirents.build();
+  }
+
+  /**
+   * One directory enumeration, with the exceptions the inherited implementation would have thrown.
+   *
+   * <p>{@code WindowsFileOperations#readDirectory} reports two failures, and it chooses between
+   * them the way {@code JavaIoFileSystem#getDirectoryEntries} does: by whether the path exists once
+   * every reparse point on it is followed. A path that is there and cannot be listed is "not a
+   * directory", whether it is a file or a directory the user may not read.
+   *
+   * <p>A third failure is possible: an enumeration that starts and then fails. {@code File#list}
+   * reports it the way it reports one that never started - by returning null - so it is decided by
+   * the same probe, into the same two exceptions. Returning the entries read so far instead would
+   * hand the caller a truncated listing it could not tell from a complete one.
+   */
+  private WindowsFileOperations.Dirents enumerate(PathFragment path) throws IOException {
+    // toAbsolutePath because WindowsOsPathPolicy calls a path with no drive letter absolute,
+    // and the native side needs one - WindowsPathOperations#asLongPath writes a \\?\ prefix,
+    // which only a drive-qualified path may carry. java.nio returns a drive-qualified path
+    // unchanged, so this costs nothing in the case that always happens.
+    String name = getNioPath(path).toAbsolutePath().toString();
+    long startTime = Profiler.instance().nanoTimeMaybe();
+    try {
+      return WindowsFileOperations.readDirectory(name);
+    } catch (NotDirectoryException e) {
+      throw new IOException(path + ERR_NOT_A_DIRECTORY, e);
+    } catch (FileNotFoundException e) {
+      throw new FileNotFoundException(path + ERR_NO_SUCH_FILE_OR_DIR);
+    } finally {
+      Profiler.instance().logSimpleTask(startTime, ProfilerTask.VFS_DIR, name);
+    }
   }
 
   @Override

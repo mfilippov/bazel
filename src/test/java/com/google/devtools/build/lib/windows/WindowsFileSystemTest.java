@@ -14,12 +14,14 @@
 
 package com.google.devtools.build.lib.windows;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
 import static java.nio.charset.StandardCharsets.ISO_8859_1;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assume.assumeTrue;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.devtools.build.lib.skyframe.DefaultSyscallCache;
 import com.google.devtools.build.lib.testutil.TestSpec;
@@ -27,6 +29,7 @@ import com.google.devtools.build.lib.testutil.TestUtils;
 import com.google.devtools.build.lib.util.OS;
 import com.google.devtools.build.lib.util.StringEncoding;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
+import com.google.devtools.build.lib.vfs.Dirent;
 import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.FileSystem.NotASymlinkException;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
@@ -41,12 +44,20 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Paths;
+import java.nio.file.attribute.AclEntry;
+import java.nio.file.attribute.AclEntryPermission;
+import java.nio.file.attribute.AclEntryType;
+import java.nio.file.attribute.AclFileAttributeView;
 import java.text.Normalizer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import javax.annotation.Nullable;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -629,5 +640,385 @@ public class WindowsFileSystemTest {
         .withMessage("w/o cache : %s", existsWithoutCache)
         .that(existsWithCache)
         .isEqualTo(existsWithoutCache);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // readdir
+  //
+  // WindowsFileSystem overrides readdir to answer from a single directory enumeration instead of
+  // re-resolving every child path. These cases pin the behaviour that override has to preserve:
+  // they were written against the inherited FileSystem#readdir first, and pass unchanged against
+  // the override.
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void testReaddirEmptyDirectory() throws Exception {
+    Path dir = scratchRoot.getRelative("empty");
+    dir.createDirectory();
+
+    assertThat(dir.readdir(Symlinks.NOFOLLOW)).isEmpty();
+  }
+
+  @Test
+  public void testReaddirReportsPlainEntries() throws Exception {
+    Path dir = scratchRoot.getRelative("dir");
+    dir.createDirectory();
+    FileSystemUtils.writeContentAsLatin1(dir.getRelative("file.txt"), "hello");
+    FileSystemUtils.createEmptyFile(dir.getRelative("zero-length"));
+    dir.getRelative("subdir").createDirectory();
+
+    assertThat(dir.readdir(Symlinks.NOFOLLOW))
+        .containsExactly(
+            new Dirent("file.txt", Dirent.Type.FILE),
+            new Dirent("zero-length", Dirent.Type.FILE),
+            new Dirent("subdir", Dirent.Type.DIRECTORY));
+  }
+
+  @Test
+  public void testReaddirReportsHiddenAndReadOnlyEntriesAsPlainFiles() throws Exception {
+    Path dir = scratchRoot.getRelative("dir");
+    dir.createDirectory();
+    Path hidden = dir.getRelative("hidden.txt");
+    Path readOnly = dir.getRelative("readonly.txt");
+    FileSystemUtils.writeContentAsLatin1(hidden, "hello");
+    FileSystemUtils.writeContentAsLatin1(readOnly, "hello");
+    Files.setAttribute(Paths.get(hidden.getPathString()), "dos:hidden", true);
+    Files.setAttribute(Paths.get(readOnly.getPathString()), "dos:readonly", true);
+
+    // FILE_ATTRIBUTE_HIDDEN and FILE_ATTRIBUTE_READONLY have no bearing on Dirent.Type. An
+    // implementation that tested dwFileAttributes for anything other than DIRECTORY and
+    // REPARSE_POINT would get these wrong.
+    assertThat(dir.readdir(Symlinks.NOFOLLOW))
+        .containsExactly(
+            new Dirent("hidden.txt", Dirent.Type.FILE),
+            new Dirent("readonly.txt", Dirent.Type.FILE));
+  }
+
+  @Test
+  public void testReaddirOnRegularFileThrows() throws Exception {
+    Path file = scratchRoot.getRelative("file.txt");
+    FileSystemUtils.writeContentAsLatin1(file, "hello");
+
+    IOException e = assertThrows(IOException.class, () -> file.readdir(Symlinks.NOFOLLOW));
+    // Not a FileNotFoundException: the path exists, it is just not a directory.
+    assertThat(e).isNotInstanceOf(FileNotFoundException.class);
+  }
+
+  @Test
+  public void testReaddirOnMissingPathThrowsFileNotFound() throws Exception {
+    Path missing = scratchRoot.getRelative("does-not-exist");
+
+    assertThrows(FileNotFoundException.class, () -> missing.readdir(Symlinks.NOFOLLOW));
+  }
+
+  @Test
+  public void testReaddirWithMissingParentThrowsFileNotFound() throws Exception {
+    Path missing = scratchRoot.getRelative("no-such-dir").getRelative("child");
+
+    assertThrows(FileNotFoundException.class, () -> missing.readdir(Symlinks.NOFOLLOW));
+  }
+
+  @Test
+  public void testReaddirNofollowReportsEveryReparsePointAsSymlink() throws Exception {
+    Path dir = scratchRoot.getRelative("dir");
+    dir.createDirectory();
+    Path target = dir.getRelative("target");
+    target.createDirectory();
+    FileSystemUtils.writeContentAsLatin1(target.getRelative("inside.txt"), "hello");
+    Path fileTarget = dir.getRelative("file-target.txt");
+    FileSystemUtils.writeContentAsLatin1(fileTarget, "hello");
+
+    testUtil.createJunctions(ImmutableMap.of("dir\\junction", "dir\\target"));
+    dir.getRelative("dirlink").createSymbolicLink(target, SymlinkTargetType.DIRECTORY);
+    dir.getRelative("filelink").createSymbolicLink(fileTarget, SymlinkTargetType.FILE);
+
+    // Bazel treats a junction like a symlink, so under NOFOLLOW each reparse point is SYMLINK.
+    // That is one FILE_ATTRIBUTE_REPARSE_POINT test for each entry, and not a lookup of the
+    // reparse tag for each entry.
+    //
+    // "filelink" is the exception, and only when createSymbolicLinks is false. createSymbolicLink
+    // then copies an existing file instead of linking to it, so the entry is an ordinary file and
+    // not a reparse point. A directory gets a junction in either mode, so "dirlink" does not
+    // change.
+    assertThat(dir.readdir(Symlinks.NOFOLLOW))
+        .containsExactly(
+            new Dirent("target", Dirent.Type.DIRECTORY),
+            new Dirent("file-target.txt", Dirent.Type.FILE),
+            new Dirent("junction", Dirent.Type.SYMLINK),
+            new Dirent("dirlink", Dirent.Type.SYMLINK),
+            new Dirent(
+                "filelink",
+                createSymbolicLinks ? Dirent.Type.SYMLINK : Dirent.Type.FILE));
+  }
+
+  @Test
+  public void testReaddirFollowResolvesReparsePoints() throws Exception {
+    Path dir = scratchRoot.getRelative("dir");
+    dir.createDirectory();
+    Path target = dir.getRelative("target");
+    target.createDirectory();
+    Path fileTarget = dir.getRelative("file-target.txt");
+    FileSystemUtils.writeContentAsLatin1(fileTarget, "hello");
+
+    testUtil.createJunctions(ImmutableMap.of("dir\\junction", "dir\\target"));
+    dir.getRelative("dirlink").createSymbolicLink(target, SymlinkTargetType.DIRECTORY);
+    dir.getRelative("filelink").createSymbolicLink(fileTarget, SymlinkTargetType.FILE);
+
+    assertThat(dir.readdir(Symlinks.FOLLOW))
+        .containsExactly(
+            new Dirent("target", Dirent.Type.DIRECTORY),
+            new Dirent("file-target.txt", Dirent.Type.FILE),
+            new Dirent("junction", Dirent.Type.DIRECTORY),
+            new Dirent("dirlink", Dirent.Type.DIRECTORY),
+            new Dirent("filelink", Dirent.Type.FILE));
+  }
+
+  @Test
+  public void testReaddirFollowReportsDanglingReparsePointsAsUnknown() throws Exception {
+    Path dir = scratchRoot.getRelative("dir");
+    dir.createDirectory();
+    Path doomed = dir.getRelative("doomed");
+    doomed.createDirectory();
+    testUtil.createJunctions(ImmutableMap.of("dir\\dangling-junction", "dir\\doomed"));
+    dir.getRelative("dangling-link")
+        .createSymbolicLink(dir.getRelative("never-existed"), SymlinkTargetType.FILE);
+    doomed.delete();
+
+    // FOLLOW has to stat the target and the stat fails; direntFromStat(null) is UNKNOWN.
+    assertThat(dir.readdir(Symlinks.FOLLOW))
+        .containsExactly(
+            new Dirent("dangling-junction", Dirent.Type.UNKNOWN),
+            new Dirent("dangling-link", Dirent.Type.UNKNOWN));
+  }
+
+  @Test
+  public void testReaddirThroughJunction() throws Exception {
+    Path dir = scratchRoot.getRelative("dir");
+    dir.createDirectory();
+    FileSystemUtils.writeContentAsLatin1(dir.getRelative("inside.txt"), "hello");
+    testUtil.createJunctions(ImmutableMap.of("junc", "dir"));
+
+    // A reparse point encountered while resolving the directory itself is followed whatever
+    // followSymlinks says; that argument only governs the types of the entries.
+    assertThat(scratchRoot.getRelative("junc").readdir(Symlinks.NOFOLLOW))
+        .containsExactly(new Dirent("inside.txt", Dirent.Type.FILE));
+  }
+
+  @Test
+  public void testReaddirWithAwkwardNames() throws Exception {
+    Path dir = scratchRoot.getRelative("dir");
+    dir.createDirectory();
+    String[] names = {
+      "space in name.txt",
+      "dot.in.name.txt",
+      "...leading-dots.txt",
+      "Привет.txt",
+      "你好.txt",
+      // A surrogate pair, so the UTF-16 unit count differs from the code point count.
+      "😀.txt",
+    };
+    for (String name : names) {
+      FileSystemUtils.writeContentAsLatin1(
+          dir.getChild(StringEncoding.unicodeToInternal(name)), "hello");
+    }
+
+    assertThat(
+            dir.readdir(Symlinks.NOFOLLOW).stream()
+                .map(d -> StringEncoding.internalToUnicode(d.getName()))
+                .collect(toImmutableList()))
+        .containsExactlyElementsIn(names);
+  }
+
+  @Test
+  public void testReaddirPathLongerThanMaxPath() throws Exception {
+    // MAX_PATH is 260; walk past it in segments none of which is individually unusual.
+    Path dir = scratchRoot;
+    for (int i = 0; i < 12; i++) {
+      dir = dir.getRelative("0123456789abcdefghijklmnopqrstuvwxyz");
+    }
+    dir.createDirectoryAndParents();
+    assertThat(dir.getPathString().length()).isGreaterThan(260);
+    FileSystemUtils.createEmptyFile(dir.getRelative("leaf.txt"));
+
+    assertThat(dir.readdir(Symlinks.NOFOLLOW))
+        .containsExactly(new Dirent("leaf.txt", Dirent.Type.FILE));
+  }
+
+  @Test
+  public void testReaddirManyEntries() throws Exception {
+    // Enough to span several FindNextFileW batches, so a truncated listing would show up here.
+    Path dir = scratchRoot.getRelative("many");
+    dir.createDirectory();
+    ImmutableList.Builder<Dirent> expected = ImmutableList.builder();
+    for (int i = 0; i < 2000; i++) {
+      FileSystemUtils.createEmptyFile(dir.getRelative("entry-" + i));
+      expected.add(new Dirent("entry-" + i, Dirent.Type.FILE));
+    }
+
+    // The contents and not only the count: a batch boundary that repeated or dropped one name
+    // would keep the count right.
+    assertThat(dir.readdir(Symlinks.NOFOLLOW)).containsExactlyElementsIn(expected.build());
+  }
+
+  @Test
+  public void testReaddirOnDanglingSymlinkToFileThrowsFileNotFound() throws Exception {
+    assumeTrue(createSymbolicLinks);
+
+    Path doomed = scratchRoot.getRelative("doomed.txt");
+    FileSystemUtils.writeContentAsLatin1(doomed, "hello");
+    Path link = scratchRoot.getRelative("dangling-link");
+    link.createSymbolicLink(doomed, SymlinkTargetType.FILE);
+    doomed.delete();
+
+    // The case a Win32 error code cannot decide on its own. Listing this path and listing a
+    // regular file both fail with ERROR_DIRECTORY, and the two have to be told apart, because
+    // File#exists follows the link and finds nothing while the file is there.
+    //
+    // RemoteActionFileSystem catches FileNotFoundException from readdir and reads the other source
+    // instead, so an IOException here turns a fall-through into a failure.
+    assertThrows(FileNotFoundException.class, () -> link.readdir(Symlinks.NOFOLLOW));
+  }
+
+  @Test
+  public void testReaddirOnUnlistableDirectoryThrowsNotADirectory() throws Exception {
+    Path dir = scratchRoot.getRelative("denied");
+    dir.createDirectory();
+    FileSystemUtils.createEmptyFile(dir.getRelative("unreachable.txt"));
+    AclEntry deny = denyListing(dir);
+    assumeTrue(deny != null);
+    try {
+      // File#list returns null for a directory the user may not list, and File#exists is true, so
+      // the inherited getDirectoryEntries reports "not a directory". A java.nio
+      // AccessDeniedException must not reach the caller: it carries neither that message nor a
+      // type readdir's callers are written against.
+      IOException e = assertThrows(IOException.class, () -> dir.readdir(Symlinks.NOFOLLOW));
+      assertThat(e).isNotInstanceOf(FileNotFoundException.class);
+      assertThat(e).hasMessageThat().endsWith(" (Not a directory)");
+    } finally {
+      // Without this the scratch tree cannot be deleted. FileSystem#deleteTreesBelow answers a
+      // failed listing by calling setReadable and setExecutable, and both are no-ops on Windows,
+      // so @After would fail and leave behind a directory that only an ACL edit can remove.
+      restoreListing(dir, deny);
+    }
+  }
+
+  @Test
+  public void testReaddirAndGetDirectoryEntriesAgree() throws Exception {
+    Path dir = scratchRoot.getRelative("dir");
+    dir.createDirectory();
+    FileSystemUtils.writeContentAsLatin1(dir.getRelative("file.txt"), "hello");
+    dir.getRelative("subdir").createDirectory();
+    testUtil.createJunctions(ImmutableMap.of("dir\\junction", "dir\\subdir"));
+
+    // The other side is File#list, which is what JavaIoFileSystem#getDirectoryEntries calls.
+    // Comparing the two overrides against each other would prove nothing, because both answer from
+    // the same enumeration - the test has to leave the class to say anything at all.
+    //
+    // Path#getDirectoryEntries returns children, not names, so both sides are reduced to names.
+    ImmutableList<String> fromFileList =
+        Arrays.stream(new File(dir.getPathString()).list())
+            .map(StringEncoding::platformToInternal)
+            .collect(toImmutableList());
+    assertThat(
+            dir.getDirectoryEntries().stream()
+                .map(Path::getBaseName)
+                .collect(toImmutableList()))
+        .containsExactlyElementsIn(fromFileList);
+    assertThat(
+            dir.readdir(Symlinks.NOFOLLOW).stream()
+                .map(Dirent::getName)
+                .collect(toImmutableList()))
+        .containsExactlyElementsIn(fromFileList);
+  }
+
+  @Test
+  public void testReaddirOnDanglingJunctionThrowsFileNotFound() throws Exception {
+    // The same case as the dangling file symlink, without needing the Create symbolic links right,
+    // so this one runs in every configuration. FindFirstFileExW reports ERROR_PATH_NOT_FOUND here
+    // and ERROR_DIRECTORY for a live junction to a file, and neither code decides the question:
+    // what decides it is that File#exists follows the junction and finds nothing.
+    Path doomed = scratchRoot.getRelative("doomed");
+    doomed.createDirectory();
+    testUtil.createJunctions(ImmutableMap.of("dangling-junction", "doomed"));
+    doomed.delete();
+
+    assertThrows(
+        FileNotFoundException.class,
+        () -> scratchRoot.getRelative("dangling-junction").readdir(Symlinks.NOFOLLOW));
+  }
+
+  @Test
+  public void testReaddirOnJunctionToAFileThrowsFileNotFound() throws Exception {
+    // A junction whose target is a file that is there. It is still reported missing, and not as
+    // "not a directory", because a junction to a file cannot be followed: the open that resolves
+    // the final reparse point fails, and File#exists reports every such failure as absent. This
+    // was measured, against a junction built exactly as below - File#list returns null and
+    // File#exists returns false, so JavaIoFileSystem#getDirectoryEntries raises this same
+    // exception. The target existing is not what the question turns on.
+    //
+    // This is the case an ordinary file separates it from: a file exists, so it is "not a
+    // directory" - see testReadDirectoryThrowsNotDirectoryForRegularFile. A Win32 error code
+    // cannot tell the two apart, because FindFirstFileExW answers ERROR_DIRECTORY for both.
+    Path target = scratchRoot.getRelative("target.txt");
+    FileSystemUtils.writeContentAsLatin1(target, "hello");
+    testUtil.createJunctions(ImmutableMap.of("junction-to-file", "target.txt"));
+
+    Path junction = scratchRoot.getRelative("junction-to-file");
+    IOException e =
+        assertThrows(
+            FileNotFoundException.class, () -> junction.readdir(Symlinks.NOFOLLOW));
+    assertThat(e).hasMessageThat().endsWith(" (No such file or directory)");
+  }
+
+  /**
+   * Denies the owner of `dir` the right to list it, and returns the entry that was added.
+   *
+   * <p>NOFOLLOW throughout, so that the descriptor of the named path is read and written directly.
+   * Following the link would mean opening the directory, and the entry this adds is what stops
+   * that, so the entry could not be taken off again.
+   *
+   * @return null if the file system carries no ACLs, in which case the caller skips
+   */
+  @Nullable
+  private static AclEntry denyListing(Path dir) {
+    AclFileAttributeView view = aclView(dir);
+    if (view == null) {
+      return null;
+    }
+    try {
+      AclEntry deny =
+          AclEntry.newBuilder()
+              .setType(AclEntryType.DENY)
+              .setPrincipal(
+                  Files.getOwner(Paths.get(dir.getPathString()), LinkOption.NOFOLLOW_LINKS))
+              .setPermissions(AclEntryPermission.LIST_DIRECTORY, AclEntryPermission.READ_DATA)
+              .build();
+      List<AclEntry> acl = new ArrayList<>(view.getAcl());
+      // First: Windows reads the list in order and stops at the first entry that matches.
+      acl.add(0, deny);
+      view.setAcl(acl);
+      // An entry that changed nothing is no fixture. An account with SeBackupPrivilege, or a
+      // filesystem that keeps the descriptor and ignores it, would leave the listing readable.
+      if (new File(dir.getPathString()).list() != null) {
+        restoreListing(dir, deny);
+        return null;
+      }
+      return deny;
+    } catch (IOException | UnsupportedOperationException e) {
+      return null;
+    }
+  }
+
+  private static void restoreListing(Path dir, AclEntry deny) throws IOException {
+    AclFileAttributeView view = aclView(dir);
+    List<AclEntry> acl = new ArrayList<>(view.getAcl());
+    acl.remove(deny);
+    view.setAcl(acl);
+  }
+
+  @Nullable
+  private static AclFileAttributeView aclView(Path dir) {
+    return Files.getFileAttributeView(
+        Paths.get(dir.getPathString()), AclFileAttributeView.class, LinkOption.NOFOLLOW_LINKS);
   }
 }

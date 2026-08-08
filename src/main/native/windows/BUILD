@@ -68,6 +68,8 @@ cc_library(
 cc_binary(
     name = "windows_jni.dll",
     srcs = [
+        "directory.cc",
+        "directory.h",
         "file-jni.cc",
         "jni-util.cc",
         "jni-util.h",

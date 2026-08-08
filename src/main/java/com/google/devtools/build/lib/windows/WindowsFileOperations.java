@@ -92,6 +92,12 @@ public class WindowsFileOperations {
   private static final int READ_SYMLINK_OR_JUNCTION_DOES_NOT_EXIST = 3;
   private static final int READ_SYMLINK_OR_JUNCTION_NOT_A_LINK = 4;
 
+  // Keep READ_DIRECTORY_* values in sync with src/main/native/windows/directory.h.
+  private static final int READ_DIRECTORY_SUCCESS = 0;
+  // READ_DIRECTORY_ERROR = 1;
+  private static final int READ_DIRECTORY_DOES_NOT_EXIST = 2;
+  private static final int READ_DIRECTORY_NOT_A_DIRECTORY = 3;
+
   // Keep STAT_* values in sync with src/main/native/windows/stat.h.
   private static final int STAT_SUCCESS = 0;
   private static final int STAT_DOES_NOT_EXIST = 1;
@@ -103,10 +109,14 @@ public class WindowsFileOperations {
   // The winnt.h attribute bits that FileMetadata reports on. Note that FILE_ATTRIBUTE_DIRECTORY is
   // set on a junction and on a directory symlink too, so a caller that distinguishes links from
   // directories must test FILE_ATTRIBUTE_REPARSE_POINT first.
+  //
+  // The three that Dirents reports raw are visible to the package, because WindowsFileSystem
+  // decides what they mean for a Dirent.Type; see the note on Dirents. FILE_ATTRIBUTE_READONLY has
+  // no such caller and stays private.
   private static final int FILE_ATTRIBUTE_READONLY = 0x00000001;
-  private static final int FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
-  private static final int FILE_ATTRIBUTE_DEVICE = 0x00000040;
-  private static final int FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+  static final int FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+  static final int FILE_ATTRIBUTE_DEVICE = 0x00000040;
+  static final int FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
 
   private static native int nativeIsSymlinkOrJunction(
       String path, boolean[] result, String[] error);
@@ -125,6 +135,9 @@ public class WindowsFileOperations {
 
   private static native int nativeStat(
       String path, boolean followReparsePoints, long[] result);
+
+  private static native int nativeReadDirectory(
+      String path, String[][] names, int[][] attributes, String[] error);
 
   /** Determines whether `path` is a junction point or directory symlink. */
   public static boolean isSymlinkOrJunction(String path) throws IOException {
@@ -312,5 +325,60 @@ public class WindowsFileOperations {
         // This is STAT_UNSUPPORTED (2).
         return null;
     }
+  }
+
+  /**
+   * One directory's entries and their Win32 file attributes, from a single enumeration.
+   *
+   * <p>Parallel arrays rather than an object per entry: a directory listing is on the hot path of
+   * every glob, and the caller allocates its own object per entry anyway.
+   *
+   * <p>Deliberately a plain carrier with no accessors of its own. Deciding what an attribute bit
+   * means - that a reparse point counts as a symbolic link, junction or not - is a question about
+   * {@code FileStatus} semantics, and it belongs next to the rest of those semantics in {@code
+   * WindowsFileSystem} rather than split across two files.
+   */
+  record Dirents(String[] names, int[] attributes) {}
+
+  /**
+   * Lists the entries of the directory at `path`, along with the attributes needed to tell files,
+   * directories and links apart, in a single directory enumeration.
+   *
+   * <p>`.` and `..` are not reported. Links among the entries are not followed; links on the way to
+   * `path` itself are, as for any other operation on that path.
+   *
+   * <p>The counterpart of {@code UnixFileSystem}'s use of {@code d_type}: the type of every entry
+   * is already known to the enumeration, so resolving each child path again only to ask for it is
+   * work the platform never required.
+   *
+   * <p>The two failures are the two that {@code JavaIoFileSystem#getDirectoryEntries} reports, and
+   * they are chosen the same way: whether the path exists after every reparse point on it is
+   * followed. A path that exists and cannot be listed - a file, a denied directory - is therefore
+   * "not a directory", exactly as {@code File#list} plus {@code File#exists} report it today. An
+   * enumeration that starts and then fails is decided by the same probe, because {@code File#list}
+   * reports it the same way: null, never the entries read so far.
+   *
+   * @throws FileNotFoundException if `path` does not exist
+   * @throws java.nio.file.NotDirectoryException if `path` exists and cannot be listed
+   * @throws IOException if `path` is not an absolute normalized Windows path; {@code PathFragment}
+   *     normalizes on construction, so no caller that starts from one can produce such a path
+   */
+  static Dirents readDirectory(String path) throws IOException {
+    String[][] names = new String[1][];
+    int[][] attributes = new int[1][];
+    String[] error = new String[] {null};
+    switch (nativeReadDirectory(
+        WindowsPathOperations.asLongPath(path), names, attributes, error)) {
+      case READ_DIRECTORY_SUCCESS:
+        return new Dirents(names[0], attributes[0]);
+      case READ_DIRECTORY_DOES_NOT_EXIST:
+        throw new FileNotFoundException(path);
+      case READ_DIRECTORY_NOT_A_DIRECTORY:
+        throw new java.nio.file.NotDirectoryException(path);
+      default:
+        // This is READ_DIRECTORY_ERROR (1). The JNI code puts a custom message in 'error[0]'.
+        break;
+    }
+    throw new IOException(String.format("Cannot list directory '%s': %s", path, error[0]));
   }
 }
