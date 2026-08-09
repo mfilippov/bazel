@@ -27,9 +27,11 @@ import com.google.devtools.build.lib.testutil.TestUtils;
 import com.google.devtools.build.lib.util.OS;
 import com.google.devtools.build.lib.util.StringEncoding;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
+import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.FileSystem.NotASymlinkException;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.Path;
+import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.SymlinkTargetType;
 import com.google.devtools.build.lib.vfs.Symlinks;
 import com.google.devtools.build.lib.windows.util.WindowsTestUtil;
@@ -113,6 +115,109 @@ public class WindowsFileSystemTest {
     // Test deleting a dangling junction.
     assertThat(juncBadPath.delete()).isTrue();
     assertThat(juncBadPath.exists(Symlinks.NOFOLLOW)).isFalse();
+  }
+
+  // The assertions below hold whichever way WindowsFileSystem#stat answered: the single native
+  // call on Windows 11 build 26100 and newer, or java.nio anywhere else. That the two agree is
+  // what they are for.
+
+  @Test
+  public void testStatOfRegularFile(@TestParameter boolean followSymlinks) throws Exception {
+    java.nio.file.Path nioPath = testUtil.scratchFile("dir\\hello.txt", "hello");
+    Path path = testUtil.createVfsPath(fs, "dir\\hello.txt");
+
+    FileStatus status = fs.stat(path.asFragment(), followSymlinks);
+
+    assertThat(status.isFile()).isTrue();
+    assertThat(status.isDirectory()).isFalse();
+    assertThat(status.isSymbolicLink()).isFalse();
+    assertThat(status.isSpecialFile()).isFalse();
+    assertThat(status.getSize()).isEqualTo(Files.size(nioPath));
+    assertThat(status.getLastModifiedTime())
+        .isEqualTo(Files.getLastModifiedTime(nioPath).toMillis());
+  }
+
+  @Test
+  public void testStatOfDirectory(@TestParameter boolean followSymlinks) throws Exception {
+    testUtil.scratchDir("a_dir");
+    Path path = testUtil.createVfsPath(fs, "a_dir");
+
+    FileStatus status = fs.stat(path.asFragment(), followSymlinks);
+
+    assertThat(status.isDirectory()).isTrue();
+    assertThat(status.isFile()).isFalse();
+    assertThat(status.isSymbolicLink()).isFalse();
+    assertThat(status.isSpecialFile()).isFalse();
+  }
+
+  @Test
+  public void testStatOfRootDirectory() throws Exception {
+    PathFragment root = PathFragment.create(scratchRoot.getPathString().substring(0, 3));
+
+    FileStatus status = fs.stat(root, /* followSymlinks= */ true);
+
+    assertThat(status.isDirectory()).isTrue();
+    assertThat(status.isSymbolicLink()).isFalse();
+  }
+
+  @Test
+  public void testStatOfJunctionDependsOnFollowSymlinks() throws Exception {
+    testUtil.scratchFile("dir\\hello.txt", "hello");
+    testUtil.createJunctions(ImmutableMap.of("junc", "dir"));
+    Path junc = testUtil.createVfsPath(fs, "junc");
+
+    FileStatus noFollow = fs.stat(junc.asFragment(), /* followSymlinks= */ false);
+    assertThat(noFollow.isSymbolicLink()).isTrue();
+    assertThat(noFollow.isDirectory()).isFalse();
+    assertThat(noFollow.isFile()).isFalse();
+    assertThat(noFollow.isSpecialFile()).isFalse();
+
+    FileStatus follow = fs.stat(junc.asFragment(), /* followSymlinks= */ true);
+    assertThat(follow.isSymbolicLink()).isFalse();
+    assertThat(follow.isDirectory()).isTrue();
+    assertThat(follow.isFile()).isFalse();
+    assertThat(follow.isSpecialFile()).isFalse();
+  }
+
+  @Test
+  public void testStatOfDanglingJunction() throws Exception {
+    testUtil.scratchDir("non_existent");
+    testUtil.createJunctions(ImmutableMap.of("junc_bad", "non_existent"));
+    Path target = testUtil.createVfsPath(fs, "non_existent");
+    Path juncBad = testUtil.createVfsPath(fs, "junc_bad");
+    assertThat(target.delete()).isTrue();
+
+    FileStatus noFollow = fs.stat(juncBad.asFragment(), /* followSymlinks= */ false);
+    assertThat(noFollow.isSymbolicLink()).isTrue();
+    assertThat(noFollow.isDirectory()).isFalse();
+
+    assertThat(fs.statIfFound(juncBad.asFragment(), /* followSymlinks= */ true)).isNull();
+  }
+
+  @Test
+  public void testStatOfMissingFile() throws Exception {
+    Path missing = testUtil.createVfsPath(fs, "no_such_file");
+
+    PathFragment fragment = missing.asFragment();
+    assertThrows(
+        FileNotFoundException.class, () -> fs.stat(fragment, /* followSymlinks= */ true));
+    assertThat(fs.statIfFound(missing.asFragment(), /* followSymlinks= */ true)).isNull();
+    assertThat(fs.statIfFound(missing.asFragment(), /* followSymlinks= */ false)).isNull();
+  }
+
+  @Test
+  public void testStatChangeTimeAgreesWithASecondResolution() throws Exception {
+    // Where the stat carries a change time this compares it against the separate call; elsewhere
+    // it exercises the fallback, which makes that separate call itself.
+    java.nio.file.Path nioPath = testUtil.scratchFile("dir\\hello.txt", "hello");
+    Path path = testUtil.createVfsPath(fs, "dir\\hello.txt");
+
+    long fromStat = fs.stat(path.asFragment(), /* followSymlinks= */ true).getLastChangeTime();
+    long fromSecondCall =
+        WindowsFileOperations.getLastChangeTime(
+            nioPath.toAbsolutePath().toString(), /* followReparsePoints= */ true);
+
+    assertThat(fromStat).isEqualTo(fromSecondCall);
   }
 
   @Test

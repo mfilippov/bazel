@@ -212,4 +212,19 @@ public class WindowsFileOperationsTest {
     assertThat(WindowsFileOperations.isSymlinkOrJunction(longPath)).isFalse();
     assertThat(WindowsFileOperations.isSymlinkOrJunction(shortPath)).isFalse();
   }
+
+  @Test
+  public void testStatDeclinesAFailureThatIsNotAMissingFile() throws Exception {
+    // "<" cannot occur in a Windows file name, so the call fails for a reason that is not "there
+    // is nothing there". Only the latter is answered here; everything else is handed back to the
+    // caller to resolve the path its own way, and reporting it as missing would tell Bazel that a
+    // file it cannot describe was deleted.
+    //
+    // The directory has to be there, or the failure would be the missing parent.
+    testUtil.scratchDir("");
+    String path = scratchRoot + "\\in<valid";
+
+    assertThat(WindowsFileOperations.statIfSupported(path, /* followReparsePoints= */ true))
+        .isNull();
+  }
 }

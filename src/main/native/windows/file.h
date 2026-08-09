@@ -146,7 +146,15 @@ struct ReadSymlinkOrJunctionResult {
 // see http://superuser.com/a/343079. In Bazel we only ever create junctions.
 int IsSymlinkOrJunction(const WCHAR* path, bool* result, wstring* error);
 
-// Retrieves the FILETIME at which `path` was last changed, including metadata.
+// Converts a FILETIME, which counts 100ns units from 1601-01-01 UTC, to the
+// milliseconds from 1970-01-01 UTC that Java counts in.
+//
+// Every time that crosses the JNI boundary passes through here, so that the two
+// sides need agree on one unit only.
+int64_t WindowsFileTimeToUnixMillis(LARGE_INTEGER filetime);
+
+// Retrieves the time at which `path` was last changed, including metadata, in
+// the Unix milliseconds that WindowsFileTimeToUnixMillis returns.
 //
 // `path` should be an absolute, normalized, Windows-style path, with "\\?\"
 // prefix if it's longer than MAX_PATH.

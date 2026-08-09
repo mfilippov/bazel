@@ -23,13 +23,13 @@ import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.JavaIoFileSystem;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.SymlinkTargetType;
+import com.google.devtools.build.lib.windows.WindowsFileOperations.FileMetadata;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.DosFileAttributes;
-import javax.annotation.Nullable;
 
 /** File system implementation for Windows. */
 @ThreadSafe
@@ -138,60 +138,64 @@ public class WindowsFileSystem extends JavaIoFileSystem {
   @Override
   public FileStatus stat(PathFragment path, boolean followSymlinks) throws IOException {
     Path nioPath = getNioPath(path);
-    final DosFileAttributes attributes;
-    try {
-      attributes = getAttribs(nioPath, followSymlinks);
-    } catch (IOException e) {
-      throw new FileNotFoundException(path + ERR_NO_SUCH_FILE_OR_DIR);
-    }
+    FileMetadata metadata = statMetadata(path, nioPath, followSymlinks);
+
+    // A reparse point is a symbolic link as far as Bazel is concerned, whether it is an NTFS
+    // symlink or a junction.
+    boolean isLink = !followSymlinks && metadata.isReparsePoint();
 
     FileStatus status =
         new FileStatus() {
-          @Nullable volatile Boolean isSymbolicLink; // null if not yet known
           volatile long lastChangeTime = -1;
 
           @Override
           public boolean isFile() {
-            return !isSymbolicLink() && (attributes.isRegularFile() || isSpecialFile());
+            return !isLink && (isRegularFile() || isSpecialFile());
+          }
+
+          private boolean isRegularFile() {
+            return !metadata.isDirectory() && !metadata.isReparsePoint() && !metadata.isDevice();
           }
 
           @Override
           public boolean isSpecialFile() {
-            // attributes.isOther() returns false for symlinks but returns true for junctions.
-            // Bazel treats junctions like symlinks. So let's return false here for junctions.
-            // This fixes https://github.com/bazelbuild/bazel/issues/9176
-            return !isSymbolicLink() && attributes.isOther();
+            // This is sun.nio.fs.WindowsFileAttributes#isOther, which is
+            // !isSymbolicLink() && (FILE_ATTRIBUTE_DEVICE | FILE_ATTRIBUTE_REPARSE_POINT).
+            // A junction answers it, and Bazel treats junctions like symlinks, so isLink has to
+            // be tested first. This fixes https://github.com/bazelbuild/bazel/issues/9176
+            return !isLink && (metadata.isDevice() || metadata.isReparsePoint());
           }
 
           @Override
           public boolean isDirectory() {
-            return !isSymbolicLink() && attributes.isDirectory();
+            return !isLink && metadata.isDirectory();
           }
 
           @Override
           public boolean isSymbolicLink() {
-            if (isSymbolicLink == null) {
-              isSymbolicLink = !followSymlinks && fileIsSymbolicLink(nioPath);
-            }
-            return isSymbolicLink;
+            return isLink;
           }
 
           @Override
           public long getSize() {
-            return attributes.size();
+            return metadata.size();
           }
 
           @Override
           public long getLastModifiedTime() {
-            return attributes.lastModifiedTime().toMillis();
+            return metadata.lastModifiedTime();
           }
 
           @Override
           public long getLastChangeTime() throws IOException {
+            if (metadata.lastChangeTime() != FileMetadata.NO_CHANGE_TIME) {
+              return metadata.lastChangeTime();
+            }
+            // The metadata came from java.nio, which carries no change time, so this costs a
+            // second path resolution.
             if (lastChangeTime == -1) {
               lastChangeTime =
-                  WindowsFileOperations.getLastChangeTime(
-                      getNioPath(path).toString(), followSymlinks);
+                  WindowsFileOperations.getLastChangeTime(nioPath.toString(), followSymlinks);
             }
             return lastChangeTime;
           }
@@ -205,11 +209,52 @@ public class WindowsFileSystem extends JavaIoFileSystem {
           @Override
           public int getPermissions() {
             // Files on Windows are implicitly readable and executable.
-            return 0555 | (attributes.isReadOnly() ? 0 : 0200);
+            return 0555 | (metadata.isReadOnly() ? 0 : 0200);
           }
         };
 
     return status;
+  }
+
+  /**
+   * Reads the metadata of {@code path}, preferring the one native call that answers all of it.
+   *
+   * <p>That call exists only on Windows 11 build 26100 and newer, and it cannot follow a reparse
+   * point. Everything it declines goes through {@code java.nio}, which costs what it costs today:
+   * an attribute read, and a second path resolution for a change time if a caller asks for one.
+   */
+  private FileMetadata statMetadata(PathFragment path, Path nioPath, boolean followSymlinks)
+      throws IOException {
+    try {
+      FileMetadata metadata =
+          WindowsFileOperations.statIfSupported(nioPath.toString(), followSymlinks);
+      if (metadata != null) {
+        return metadata;
+      }
+
+      DosFileAttributes attributes = getAttribs(nioPath, followSymlinks);
+      // An entry that is neither a symbolic link nor "other" cannot be a reparse point, so
+      // fileIsSymbolicLink - which resolves the path again - runs only for one that could be.
+      // DosFileAttributes#isOther is true for a junction and for a device alike, and only that
+      // second test tells the two apart.
+      boolean isReparsePoint =
+          !followSymlinks
+              && (attributes.isSymbolicLink() || attributes.isOther())
+              && fileIsSymbolicLink(nioPath);
+      return new FileMetadata(
+          attributes.isDirectory(),
+          isReparsePoint,
+          !isReparsePoint && attributes.isOther(),
+          attributes.isReadOnly(),
+          attributes.size(),
+          attributes.lastModifiedTime().toMillis(),
+          FileMetadata.NO_CHANGE_TIME);
+    } catch (IOException e) {
+      // Every failure becomes a FileNotFoundException, because that is the only type
+      // JavaIoFileSystem#statIfFound turns into a null; it wraps any other IOException in an
+      // IllegalStateException, so a denied path would stop the server.
+      throw new FileNotFoundException(path + ERR_NO_SUCH_FILE_OR_DIR);
+    }
   }
 
   @Override

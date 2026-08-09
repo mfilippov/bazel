@@ -20,6 +20,7 @@ import com.google.devtools.build.lib.vfs.PathFragment;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.AccessDeniedException;
+import javax.annotation.Nullable;
 
 /** File operations on Windows. */
 public class WindowsFileOperations {
@@ -91,6 +92,22 @@ public class WindowsFileOperations {
   private static final int READ_SYMLINK_OR_JUNCTION_DOES_NOT_EXIST = 3;
   private static final int READ_SYMLINK_OR_JUNCTION_NOT_A_LINK = 4;
 
+  // Keep STAT_* values in sync with src/main/native/windows/stat.h.
+  private static final int STAT_SUCCESS = 0;
+  private static final int STAT_DOES_NOT_EXIST = 1;
+  // STAT_UNSUPPORTED = 2;
+
+  // Keep STAT_RESULT_LENGTH in sync with kStatResultLength in src/main/native/windows/stat.h.
+  private static final int STAT_RESULT_LENGTH = 4;
+
+  // The winnt.h attribute bits that FileMetadata reports on. Note that FILE_ATTRIBUTE_DIRECTORY is
+  // set on a junction and on a directory symlink too, so a caller that distinguishes links from
+  // directories must test FILE_ATTRIBUTE_REPARSE_POINT first.
+  private static final int FILE_ATTRIBUTE_READONLY = 0x00000001;
+  private static final int FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+  private static final int FILE_ATTRIBUTE_DEVICE = 0x00000040;
+  private static final int FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+
   private static native int nativeIsSymlinkOrJunction(
       String path, boolean[] result, String[] error);
 
@@ -105,6 +122,9 @@ public class WindowsFileOperations {
       String name, String[] result, String[] error);
 
   private static native int nativeDeletePath(String path, String[] error);
+
+  private static native int nativeStat(
+      String path, boolean followReparsePoints, long[] result);
 
   /** Determines whether `path` is a junction point or directory symlink. */
   public static boolean isSymlinkOrJunction(String path) throws IOException {
@@ -235,6 +255,62 @@ public class WindowsFileOperations {
       default:
         // This is DELETE_PATH_ERROR (1). The JNI code puts a custom message in 'error[0]'.
         throw new IOException(String.format("Cannot delete path '%s': %s", path, error[0]));
+    }
+  }
+
+  /**
+   * The metadata of one file.
+   *
+   * <p>{@code lastModifiedTime} and {@code lastChangeTime} are Unix milliseconds, as {@link
+   * #getLastChangeTime} returns; file-jni.cc converts the FILETIME ticks the platform reports, so
+   * that both calls speak the one unit. {@code lastChangeTime} is {@link #NO_CHANGE_TIME} when the
+   * metadata came from a source that carries no change time.
+   */
+  record FileMetadata(
+      boolean isDirectory,
+      boolean isReparsePoint,
+      boolean isDevice,
+      boolean isReadOnly,
+      long size,
+      long lastModifiedTime,
+      long lastChangeTime) {
+
+    /** No change time is available; reading one costs a further path resolution. */
+    static final long NO_CHANGE_TIME = -1;
+  }
+
+  /**
+   * Describes `path`, including its change time, in a single path resolution, or returns null if
+   * this system cannot.
+   *
+   * <p>Only Windows 11 build 26100 and newer can: see {@code bazel::windows::Stat}. Null is also
+   * the answer for a reparse point that `followReparsePoints` asks to resolve, and for a filesystem
+   * that does not implement the query. A caller that receives it resolves the path the way it did
+   * before, at no greater cost.
+   *
+   * @throws FileNotFoundException if `path` does not exist
+   */
+  @Nullable
+  static FileMetadata statIfSupported(String path, boolean followReparsePoints)
+      throws FileNotFoundException {
+    // Layout, in sync with nativeStat in file-jni.cc: attributes, size, last modified, last change.
+    long[] result = new long[STAT_RESULT_LENGTH];
+    switch (nativeStat(WindowsPathOperations.asLongPath(path), followReparsePoints, result)) {
+      case STAT_SUCCESS:
+        int attributes = (int) result[0];
+        return new FileMetadata(
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
+            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0,
+            (attributes & FILE_ATTRIBUTE_DEVICE) != 0,
+            (attributes & FILE_ATTRIBUTE_READONLY) != 0,
+            result[1],
+            result[2],
+            result[3]);
+      case STAT_DOES_NOT_EXIST:
+        throw new FileNotFoundException(path);
+      default:
+        // This is STAT_UNSUPPORTED (2).
+        return null;
     }
   }
 }

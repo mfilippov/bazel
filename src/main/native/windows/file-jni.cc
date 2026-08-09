@@ -25,6 +25,7 @@
 #include "src/main/native/jni.h"
 #include "src/main/native/windows/file.h"
 #include "src/main/native/windows/jni-util.h"
+#include "src/main/native/windows/stat.h"
 #include "src/main/native/windows/util.h"
 
 static bool CanReportError(JNIEnv* env, jobjectArray error_msg_holder) {
@@ -158,6 +159,35 @@ Java_com_google_devtools_build_lib_windows_WindowsFileOperations_nativeDeletePat
         env, error_msg_holder);
   }
   return result;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_google_devtools_build_lib_windows_WindowsFileOperations_nativeStat(
+    JNIEnv* env, jclass clazz, jstring path, jboolean follow_reparse_points,
+    jlongArray result_holder) {
+  std::wstring wpath(bazel::windows::GetJavaWstring(env, path));
+  bazel::windows::FileMetadata metadata = {};
+  int result =
+      bazel::windows::Stat(wpath.c_str(), follow_reparse_points, &metadata);
+  if (result != bazel::windows::StatResult::kSuccess) {
+    // Neither outcome carries a message: "does not exist" needs none, and every
+    // other failure is an instruction to the caller to resolve the path the way
+    // it did before, not an error to report.
+    return static_cast<jint>(result);
+  }
+
+  // Keep the layout in sync with WindowsFileOperations#stat. The times are
+  // converted here, so that every time Java receives from this file is in the
+  // one unit Java counts in, as nativeGetChangeTime's already is.
+  jlong values[bazel::windows::kStatResultLength] = {
+      static_cast<jlong>(metadata.attributes),
+      static_cast<jlong>(metadata.size),
+      bazel::windows::WindowsFileTimeToUnixMillis(metadata.last_write_time),
+      bazel::windows::WindowsFileTimeToUnixMillis(metadata.change_time),
+  };
+  env->SetLongArrayRegion(result_holder, 0, bazel::windows::kStatResultLength,
+                          values);
+  return static_cast<jint>(bazel::windows::StatResult::kSuccess);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
