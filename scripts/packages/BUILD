@@ -169,10 +169,10 @@ genrule(
     outs = [
         "version.txt",
     ],
-    cmd =
-        "find -L . -name stable-status.txt -exec cat '{}' ';'" +
-        " | grep EMBED_LABEL | cut -d ' ' -f 2-" +
-        " > $@\n",
+    # Read the stamp file directly instead of searching the execroot: without a
+    # sandbox (e.g. on Windows) `find` races with temp directories of
+    # concurrent actions and fails under pipefail.
+    cmd = "grep EMBED_LABEL bazel-out/stable-status.txt | cut -d ' ' -f 2- > $@",
     stamp = 1,
 )
 
